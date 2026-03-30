@@ -1,3 +1,7 @@
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <time.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -17,7 +21,9 @@ mcast_t *multicast_init(char *mcast_addr, int sport, int rport)
         exit(1);
     }
     int optval = 1;
+#ifdef SO_REUSEPORT
     setsockopt(m->sock, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+#endif
     setsockopt(m->sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
     bzero((char *)&(m->addr), sizeof(m->addr));

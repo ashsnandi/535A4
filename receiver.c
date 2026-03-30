@@ -1,0 +1,215 @@
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include "multicast.h"
+#include "shared_structs.h"
+
+#define MAX_FILES 256
+#define RECV_BUFFER_SIZE 65536
+
+struct received_file {
+  bool has_metadata;
+  bool completed;
+  uint32_t file_size;
+  uint32_t file_checksum;
+  uint32_t total_chunks;
+  char **chunks;
+  uint32_t *chunk_sizes;
+  bool *received;
+  uint32_t received_count;
+};
+
+static uint32_t compute_chunk_checksum(const char *data, uint32_t size) {
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < size; i++) {
+    sum += (unsigned char)data[i];
+  }
+  return sum;
+}
+
+static int ensure_received_dir(void) {
+  if (mkdir("received_files", 0755) == 0) {
+    return 0;
+  }
+  if (errno == EEXIST) {
+    return 0;
+  }
+  perror("mkdir received_files");
+  return -1;
+}
+
+static int init_file_state(struct received_file *file, const struct MetadataPacket *meta) {
+  file->file_size = meta->file_size;
+  file->file_checksum = meta->file_checksum;
+  file->total_chunks = meta->total_chunks;
+  file->received_count = 0;
+  file->completed = false;
+
+  file->chunks = calloc(file->total_chunks, sizeof(char *));
+  file->chunk_sizes = calloc(file->total_chunks, sizeof(uint32_t));
+  file->received = calloc(file->total_chunks, sizeof(bool));
+  if (!file->chunks || !file->chunk_sizes || !file->received) {
+    fprintf(stderr, "Allocation failed for file tracking state\n");
+    return -1;
+  }
+
+  file->has_metadata = true;
+  return 0;
+}
+
+static int write_completed_file(int file_id, const struct received_file *file) {
+  char path[128];
+  snprintf(path, sizeof(path), "received_files/file_%d.bin", file_id);
+
+  FILE *out = fopen(path, "wb");
+  if (!out) {
+    perror("fopen output file");
+    return -1;
+  }
+
+  uint32_t calculated_file_checksum = 0;
+  for (uint32_t i = 0; i < file->total_chunks; i++) {
+    size_t written = fwrite(file->chunks[i], 1, file->chunk_sizes[i], out);
+    if (written != file->chunk_sizes[i]) {
+      fclose(out);
+      fprintf(stderr, "Failed while writing file_%d.bin\n", file_id);
+      return -1;
+    }
+    calculated_file_checksum += compute_chunk_checksum(file->chunks[i], file->chunk_sizes[i]);
+  }
+
+  fclose(out);
+
+  if (calculated_file_checksum != file->file_checksum) {
+    fprintf(stderr, "Final checksum mismatch for file %d (expected=%u got=%u)\n",
+        file_id, file->file_checksum, calculated_file_checksum);
+    return -1;
+  }
+
+  printf("Completed file %d -> %s (%u chunks)\n", file_id, path, file->total_chunks);
+  return 0;
+}
+
+static void process_metadata(struct received_file files[], const struct MetadataPacket *meta) {
+  if (meta->file_id < 0 || meta->file_id >= MAX_FILES) {
+    return;
+  }
+
+  struct received_file *file = &files[meta->file_id];
+  if (!file->has_metadata) {
+    if (init_file_state(file, meta) != 0) {
+      exit(1);
+    }
+    printf("Metadata file_id=%d chunks=%u size=%u\n", meta->file_id, meta->total_chunks, meta->file_size);
+  }
+}
+
+static void process_data(struct received_file files[], const struct DataPacket *packet, int packet_len) {
+  if (packet->file_id < 0 || packet->file_id >= MAX_FILES) {
+    return;
+  }
+
+  struct received_file *file = &files[packet->file_id];
+  if (!file->has_metadata || file->completed) {
+    return;
+  }
+
+  if (packet->seq_num < 0 || (uint32_t)packet->seq_num >= file->total_chunks) {
+    return;
+  }
+
+  uint32_t payload_offset = (uint32_t)offsetof(struct DataPacket, data);
+  if (packet_len <= (int)payload_offset) {
+    return;
+  }
+
+  uint32_t payload_len = (uint32_t)packet_len - payload_offset;
+  if (payload_len == 0 || payload_len > file->file_size) {
+    return;
+  }
+
+  uint32_t calculated = compute_chunk_checksum(packet->data, payload_len);
+  if (calculated != packet->chunk_checksum) {
+    return;
+  }
+
+  if (file->received[packet->seq_num]) {
+    return;
+  }
+
+  file->chunks[packet->seq_num] = malloc(payload_len);
+  if (!file->chunks[packet->seq_num]) {
+    fprintf(stderr, "malloc failed for chunk\n");
+    exit(1);
+  }
+
+  memcpy(file->chunks[packet->seq_num], packet->data, payload_len);
+  file->chunk_sizes[packet->seq_num] = payload_len;
+  file->received[packet->seq_num] = true;
+  file->received_count++;
+
+  if (file->received_count == file->total_chunks) {
+    if (write_completed_file(packet->file_id, file) == 0) {
+      file->completed = true;
+    }
+  }
+}
+
+int main(void) {
+  if (ensure_received_dir() != 0) {
+    return 1;
+  }
+
+  struct received_file files[MAX_FILES] = {0};
+
+  mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
+  multicast_setup_recv(m);
+
+  unsigned char buffer[RECV_BUFFER_SIZE];
+  while (1) {
+    if (multicast_check_receive(m) <= 0) {
+      continue;
+    }
+
+    int n = multicast_receive(m, buffer, sizeof(buffer));
+    if (n == (int)sizeof(struct MetadataPacket)) {
+      process_metadata(files, (const struct MetadataPacket *)buffer);
+    } else if (n >= (int)offsetof(struct DataPacket, data)) {
+      process_data(files, (const struct DataPacket *)buffer, n);
+    }
+  }
+
+  multicast_destroy(m);
+  return 0;
+}
+
+/*
+B: Receiver Program (receiver.c)
+
+- Join the multicast group and listen for chunks
+
+- Reassembly:
+  * Buffer chunks in RAM OR write to disk incrementally
+  * Handle out-of-order delivery using sequence numbers
+
+- Validation:
+  * Verify chunk checksums
+    - discard corrupted chunks
+
+  * Detect and re-request missing chunks
+
+- Validate final files
+
+- Save files to disk
+  (e.g., train.csv in received_files/)
+  
+  */

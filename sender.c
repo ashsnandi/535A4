@@ -1,14 +1,20 @@
 // sender.c
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "multicast.h"
 // shared header for shared defs?
 #include "shared_structs.h"
+
+uint32_t compute_chunk_checksum(char *givenChunk, int size);
 
 // helper: open one file and split into chunks
 // Note that this includes no error checks as of now
@@ -109,17 +115,23 @@ void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count) {
         for (int j = 0; j < files[i].total_chunks; j++) {
             //Create a data packet for this chunk
             int chunk_size = files[i].chunk_sizes[j];
-            struct DataPacket dPac;
-            dPac.seq_num = j;
-            dPac.file_id = files[i].file_id;
-            dPac.chunk_checksum = files[i].chunk_checksums[j];
+            size_t packet_size = offsetof(struct DataPacket, data) + chunk_size;
+            struct DataPacket *dPac = malloc(packet_size);
+            if (!dPac) {
+                fprintf(stderr, "Failed to allocate data packet\n");
+                exit(1);
+            }
+
+            dPac->seq_num = j;
+            dPac->file_id = files[i].file_id;
+            dPac->chunk_checksum = files[i].chunk_checksums[j];
             
             // Actually copy the chunk data into the packet's data field
-            memcpy(dPac.data, files[i].chunks[j], chunk_size);
+            memcpy(dPac->data, files[i].chunks[j], chunk_size);
             // send data packet using multicast_send (need to implement this function in multicast.c)
 
-            int packet_size = sizeof(struct DataPacket) + chunk_size;
-            multicast_send(m, &dPac, packet_size);
+            multicast_send(m, dPac, (int)packet_size);
+            free(dPac);
         }
     }
 }

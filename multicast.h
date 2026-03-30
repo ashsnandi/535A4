@@ -1,9 +1,14 @@
 #ifndef __MULTICAST_H__
 #define __MULTICAST_H__
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <sys/poll.h>
 
