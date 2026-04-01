@@ -16,6 +16,10 @@
 #define MAX_FILES 256
 #define RECV_BUFFER_SIZE 65536
 
+/*
+ * In-memory state for one file being reconstructed from multicast chunks.
+ * The receiver indexes this array by file_id.
+ */
 struct received_file {
   bool has_metadata;
   bool completed;
@@ -28,6 +32,7 @@ struct received_file {
   uint32_t received_count;
 };
 
+/* Simple additive checksum used by both sender and receiver. */
 static uint32_t compute_chunk_checksum(const char *data, uint32_t size) {
   uint32_t sum = 0;
   for (uint32_t i = 0; i < size; i++) {
@@ -36,6 +41,7 @@ static uint32_t compute_chunk_checksum(const char *data, uint32_t size) {
   return sum;
 }
 
+/* Ensure output directory exists for reconstructed files. */
 static int ensure_received_dir(void) {
   if (mkdir("received_files", 0755) == 0) {
     return 0;
@@ -47,6 +53,7 @@ static int ensure_received_dir(void) {
   return -1;
 }
 
+/* Allocate and initialize per-file buffers after metadata arrives. */
 static int init_file_state(struct received_file *file, const struct MetadataPacket *meta) {
   file->file_size = meta->file_size;
   file->file_checksum = meta->file_checksum;
@@ -66,6 +73,10 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
   return 0;
 }
 
+/*
+ * Reassemble a completed file in chunk order and verify final checksum
+ * before reporting success.
+ */
 static int write_completed_file(int file_id, const struct received_file *file) {
   char path[128];
   snprintf(path, sizeof(path), "received_files/file_%d.bin", file_id);
@@ -99,6 +110,7 @@ static int write_completed_file(int file_id, const struct received_file *file) {
   return 0;
 }
 
+/* Handle metadata packet: allocate tracking state on first sighting. */
 static void process_metadata(struct received_file files[], const struct MetadataPacket *meta) {
   if (meta->file_id < 0 || meta->file_id >= MAX_FILES) {
     return;
@@ -113,6 +125,10 @@ static void process_metadata(struct received_file files[], const struct Metadata
   }
 }
 
+/*
+ * Handle data packet: validate bounds/checksum, store chunk once,
+ * and finalize the file when all chunks are present.
+ */
 static void process_data(struct received_file files[], const struct DataPacket *packet, int packet_len) {
   if (packet->file_id < 0 || packet->file_id >= MAX_FILES) {
     return;
@@ -165,21 +181,25 @@ static void process_data(struct received_file files[], const struct DataPacket *
 }
 
 int main(void) {
+  /* Prepare output directory and initialize per-file state table. */
   if (ensure_received_dir() != 0) {
     return 1;
   }
 
   struct received_file files[MAX_FILES] = {0};
 
+  /* Join multicast group and begin receive loop. */
   mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
   multicast_setup_recv(m);
 
   unsigned char buffer[RECV_BUFFER_SIZE];
   while (1) {
+    /* Poll before recvfrom to avoid blocking forever when idle. */
     if (multicast_check_receive(m) <= 0) {
       continue;
     }
 
+    /* Dispatch by packet size: metadata has fixed size, data is variable. */
     int n = multicast_receive(m, buffer, sizeof(buffer));
     if (n == (int)sizeof(struct MetadataPacket)) {
       process_metadata(files, (const struct MetadataPacket *)buffer);
@@ -191,25 +211,3 @@ int main(void) {
   multicast_destroy(m);
   return 0;
 }
-
-/*
-B: Receiver Program (receiver.c)
-
-- Join the multicast group and listen for chunks
-
-- Reassembly:
-  * Buffer chunks in RAM OR write to disk incrementally
-  * Handle out-of-order delivery using sequence numbers
-
-- Validation:
-  * Verify chunk checksums
-    - discard corrupted chunks
-
-  * Detect and re-request missing chunks
-
-- Validate final files
-
-- Save files to disk
-  (e.g., train.csv in received_files/)
-  
-  */
