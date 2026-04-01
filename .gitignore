@@ -1,3 +1,4 @@
 .DS_Store
 share/train.csv
 share/test.csv
+.vscode/
