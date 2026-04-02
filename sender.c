@@ -13,6 +13,7 @@
 #include "multicast.h"
 // shared header for shared defs?
 #include "shared_structs.h"
+#include <unistd.h> // for sleeping
 
 uint32_t compute_chunk_checksum(char *givenChunk, int size);
 
@@ -125,28 +126,44 @@ void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count) {
             dPac->seq_num = j;
             dPac->file_id = files[i].file_id;
             dPac->chunk_checksum = files[i].chunk_checksums[j];
-            
+            dPac->type = DATA_TYPE;
             // Actually copy the chunk data into the packet's data field
             memcpy(dPac->data, files[i].chunks[j], chunk_size);
             // send data packet using multicast_send (need to implement this function in multicast.c)
 
             multicast_send(m, dPac, (int)packet_size);
             free(dPac);
+            
         }
+        // add a small delay to not overwhelm the network
+        sleep(1);
     }
 }
 
 // helper for sending a metadata packet
 void send_metadata_packet(mcast_t *m, struct chunked_file file) {
-    struct MetadataPacket meta;
-    meta.file_size = file.file_size;
-    meta.file_checksum = file.file_checksum;
-    meta.total_chunks = file.total_chunks;
-    meta.file_id = file.file_id;
+    struct MetadataPacket met;
+    met.file_size = file.file_size;
+    met.file_checksum = file.file_checksum;
+    met.total_chunks = file.total_chunks;
+    met.file_id = file.file_id;
+    met.type = META_TYPE; // just to be explicit, not really needed since we can infer from struct but it's fine
 
     int packet_size = sizeof(struct MetadataPacket);
+
+    // Get filename from chunked_file struct and put it in metadata packet
+    // %s standard formating for strings, and specify size to avoid overflow
+    // strrchr gets pointer to instance of last '/' in filename
+    // Worked a lot with pointers in c++ 322 class so I know we can just set the base pointer to be one after the '/' to get just the filename itself
+    // this is for an edge case like if we run ./sender -c 1024 /pathto/train.csv
+    char *base = strrchr(file.filename, '/');
+    // Note base will be null if no '/' in filename
+    // base + 1 gives us pointer to start of filename since the '/' is at the *base address
+    snprintf(met.filename, sizeof(met.filename), "%s", base ? base + 1 : file.filename);
+
+
     // send metadata packet using multicast_send (need to implement this function in multicast.c)
-    multicast_send(m, &meta, packet_size);
+    multicast_send(m, &met, packet_size);
 }
 
 
@@ -164,6 +181,12 @@ int main(int argc, char *argv[]) {
     int chunk_size = 1024; // default chunk size
     int file_one_idx = 1; // index of first file argument in argv
 
+    // Note argc includes the program name so this basically means no files inputted
+    if (argc < 2) {
+        fprintf(stderr, "Input clearly too few arguments!\n");
+        return 1;
+    }
+
     // Check for -c without a following chunk size
     if (strcmp(argv[1], "-c") == 0 && argc <= 2) {
         fprintf(stderr, "No chunk size given after -c\n");
@@ -172,7 +195,15 @@ int main(int argc, char *argv[]) {
 
     // Check for optional -c argument
     if (strcmp(argv[1], "-c") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "No chunk size given after -c\n");
+            return 1;
+        }
         chunk_size = atoi(argv[2]);
+        if (chunk_size <= 0) {
+            fprintf(stderr, "Chunk size can't be zero or negative!\n");
+            return 1;
+        }
         file_one_idx = 3;
     }
 
@@ -201,6 +232,8 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < file_count; i++) {
             send_metadata_packet(m, files[i]);
         }
+
+        sleep(1);
 
         send_all_chunks(m, files, file_count);
         // Send all chunks from all files cyclically for now (can optimize later)

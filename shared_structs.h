@@ -5,18 +5,26 @@
 #include <stdbool.h>
 
 // Maybe a packet header struct as well?
+#define m_file_name_max_len 128
+
+#define META_TYPE 0
+#define DATA_TYPE 1
 
 struct MetadataPacket {
+    int type; // 0 for meta
     uint32_t file_size;
     uint32_t file_checksum;
     uint32_t total_chunks;
     int file_id;
+    char filename[m_file_name_max_len];
 };
 
 struct DataPacket {
+    int type; // 1 for data
     int file_id;
     int seq_num;
     uint32_t chunk_checksum;
+    // flexible array has to be last in struct. Just a thing in C
     char data[]; // flexible
 };
 

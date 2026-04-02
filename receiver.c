@@ -30,6 +30,7 @@ struct received_file {
   uint32_t *chunk_sizes;
   bool *received;
   uint32_t received_count;
+  char filename[m_file_name_max_len]; 
 };
 
 /* Simple additive checksum used by both sender and receiver. */
@@ -69,6 +70,8 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
     return -1;
   }
 
+  snprintf(file->filename, sizeof(file->filename), "%s", meta->filename);
+
   file->has_metadata = true;
   return 0;
 }
@@ -77,9 +80,9 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
  * Reassemble a completed file in chunk order and verify final checksum
  * before reporting success.
  */
-static int write_completed_file(int file_id, const struct received_file *file) {
+static int write_completed_file(const struct received_file *file) {
   char path[128];
-  snprintf(path, sizeof(path), "received_files/file_%d.bin", file_id);
+  snprintf(path, sizeof(path), "received_files/%s", file->filename);
 
   FILE *out = fopen(path, "wb");
   if (!out) {
@@ -92,7 +95,7 @@ static int write_completed_file(int file_id, const struct received_file *file) {
     size_t written = fwrite(file->chunks[i], 1, file->chunk_sizes[i], out);
     if (written != file->chunk_sizes[i]) {
       fclose(out);
-      fprintf(stderr, "Failed while writing file_%d.bin\n", file_id);
+      fprintf(stderr, "Failed while writing %s\n", file->filename);
       return -1;
     }
     calculated_file_checksum += compute_chunk_checksum(file->chunks[i], file->chunk_sizes[i]);
@@ -101,12 +104,12 @@ static int write_completed_file(int file_id, const struct received_file *file) {
   fclose(out);
 
   if (calculated_file_checksum != file->file_checksum) {
-    fprintf(stderr, "Final checksum mismatch for file %d (expected=%u got=%u)\n",
-        file_id, file->file_checksum, calculated_file_checksum);
+    fprintf(stderr, "Final checksum mismatch for file %s (expected=%u got=%u)\n",
+        file->filename, file->file_checksum, calculated_file_checksum);
     return -1;
   }
 
-  printf("Completed file %d -> %s (%u chunks)\n", file_id, path, file->total_chunks);
+  printf("Completed file %s -> %s (%u chunks)\n", file->filename, path, file->total_chunks);
   return 0;
 }
 
@@ -174,7 +177,7 @@ static void process_data(struct received_file files[], const struct DataPacket *
   file->received_count++;
 
   if (file->received_count == file->total_chunks) {
-    if (write_completed_file(packet->file_id, file) == 0) {
+    if (write_completed_file(file) == 0) {
       file->completed = true;
     }
   }
@@ -201,9 +204,15 @@ int main(void) {
 
     /* Dispatch by packet size: metadata has fixed size, data is variable. */
     int n = multicast_receive(m, buffer, sizeof(buffer));
-    if (n == (int)sizeof(struct MetadataPacket)) {
+
+    // Reads first 4 bytes of buffer to check type (only works because we have type as first field in both)
+    int packet_type = *((int *)buffer);
+
+    //if (n == (int)sizeof(struct MetadataPacket)) {
+    if (packet_type == META_TYPE) {
       process_metadata(files, (const struct MetadataPacket *)buffer);
-    } else if (n >= (int)offsetof(struct DataPacket, data)) {
+    // } else if (n >= (int)offsetof(struct DataPacket, data)) {
+    } else if (packet_type == DATA_TYPE) {
       process_data(files, (const struct DataPacket *)buffer, n);
     }
   }
