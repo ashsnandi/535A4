@@ -14,8 +14,17 @@
 // shared header for shared defs?
 #include "shared_structs.h"
 #include <unistd.h> // for sleeping
+#include <time.h> // for stats timing
 
 uint32_t compute_chunk_checksum(char *givenChunk, int size);
+
+struct send_statistics {
+    uint32_t data_packets_sent;
+    uint32_t meta_packets_sent;
+    uint64_t bytes_sent;
+    uint32_t cycles_sent;
+    time_t kickoff_time;
+};
 
 // helper: open one file and split into chunks
 // Note that this includes no error checks as of now
@@ -110,7 +119,7 @@ uint32_t compute_chunk_checksum(char *givenChunk, int size) {
 }
 
 // helper for sending a chunk
-void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count) {
+void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count, struct send_statistics *s) {
     // send chunks from all files sequentially for now (can optimize later using round robin or something)
     for (int i = 0; i < file_count; i++) {
         for (int j = 0; j < files[i].total_chunks; j++) {
@@ -133,15 +142,19 @@ void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count) {
 
             multicast_send(m, dPac, (int)packet_size);
             free(dPac);
-            
+
+            // Add to statistics
+            s->data_packets_sent++;
+            s->bytes_sent += packet_size;
         }
+
         // add a small delay to not overwhelm the network
         sleep(1);
     }
 }
 
 // helper for sending a metadata packet
-void send_metadata_packet(mcast_t *m, struct chunked_file file) {
+void send_metadata_packet(mcast_t *m, struct chunked_file file, struct send_statistics *stats) {
     struct MetadataPacket met;
     met.file_size = file.file_size;
     met.file_checksum = file.file_checksum;
@@ -164,6 +177,9 @@ void send_metadata_packet(mcast_t *m, struct chunked_file file) {
 
     // send metadata packet using multicast_send (need to implement this function in multicast.c)
     multicast_send(m, &met, packet_size);
+    // Add to statistics
+    stats->meta_packets_sent++;
+    stats->bytes_sent += packet_size;
 }
 
 
@@ -213,8 +229,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Create chunked_file structs for each file argument
     int file_count = argc - file_one_idx;
     struct chunked_file *files = malloc(file_count * sizeof(struct chunked_file));
+
+    // Create statistics struct and initialize kickoff time
+    struct send_statistics statistics;
+    statistics.kickoff_time = time(NULL);
+    statistics.cycles_sent = 0;
+    statistics.data_packets_sent = 0;
+    statistics.meta_packets_sent = 0;
+    statistics.bytes_sent = 0;
 
     // initialize multicast sender
     // This is example code right here
@@ -230,15 +255,40 @@ int main(int argc, char *argv[]) {
     while (1) {
         // Send all metadata
         for (int i = 0; i < file_count; i++) {
-            send_metadata_packet(m, files[i]);
+            send_metadata_packet(m, files[i], &statistics);
         }
 
         sleep(1);
 
-        send_all_chunks(m, files, file_count);
+        send_all_chunks(m, files, file_count, &statistics);
         // Send all chunks from all files cyclically for now (can optimize later)
 
         // Update stats
+        statistics.cycles_sent++;
+
+        // Print statistics every cycle
+        time_t current_time = time(NULL);
+        double total_time = difftime(current_time, statistics.kickoff_time);
+
+        double packsPerSec = 0.0;
+        double bytesPerSec = 0.0;
+
+        // Avoid zero devision
+        if (total_time <= 0) total_time = 1;
+
+        packsPerSec = (statistics.meta_packets_sent + statistics.data_packets_sent) / total_time;
+        bytesPerSec = statistics.bytes_sent / total_time;
+        
+
+        printf("////////////// Statistics ///////////////\n");
+        printf("  Cycles: %u\n", statistics.cycles_sent);
+        printf("  Meta packets fired: %u\n", statistics.meta_packets_sent);
+        printf("  Data packets fired: %u\n", statistics.data_packets_sent);
+        printf("  Throughput in packets/sec: %.2f\n", packsPerSec);
+        printf("  Byte rate in bytes/sec: %.2f\n", bytesPerSec);
+
+        // printf("  Total chunks: %u\n", statistics.chunks_sent);
+        // printf("  Total bytes: %u\n", statistics.bytes_sent);
     }
 
     // free chunk memory

@@ -12,9 +12,16 @@
 #include <sys/stat.h>
 #include "multicast.h"
 #include "shared_structs.h"
+#include "time.h" // stats timing
 
 #define MAX_FILES 256
 #define RECV_BUFFER_SIZE 65536
+
+struct recieve_statistics {
+    bool done;
+    time_t kickoff_time;
+    time_t end_time;
+};
 
 /*
  * In-memory state for one file being reconstructed from multicast chunks.
@@ -132,7 +139,7 @@ static void process_metadata(struct received_file files[], const struct Metadata
  * Handle data packet: validate bounds/checksum, store chunk once,
  * and finalize the file when all chunks are present.
  */
-static void process_data(struct received_file files[], const struct DataPacket *packet, int packet_len) {
+static void process_data(struct received_file files[], const struct DataPacket *packet, int packet_len, struct recieve_statistics *s) {
   if (packet->file_id < 0 || packet->file_id >= MAX_FILES) {
     return;
   }
@@ -179,6 +186,20 @@ static void process_data(struct received_file files[], const struct DataPacket *
   if (file->received_count == file->total_chunks) {
     if (write_completed_file(file) == 0) {
       file->completed = true;
+
+      // scan if all files completed to update stats
+      bool totally_completed = true;
+      for (int i = 0; i < MAX_FILES; i++) {
+        if (files[i].has_metadata && !files[i].completed) {
+          totally_completed = false;
+          break;
+        }
+      }
+      if (totally_completed) {
+        s->done = true;
+        s->end_time = time(NULL);
+      }
+
     }
   }
 }
@@ -196,6 +217,12 @@ int main(void) {
   multicast_setup_recv(m);
 
   unsigned char buffer[RECV_BUFFER_SIZE];
+
+  // start time for stats
+  struct recieve_statistics statistics;
+  statistics.kickoff_time = time(NULL);
+  statistics.done = false;
+
   while (1) {
     /* Poll before recvfrom to avoid blocking forever when idle. */
     if (multicast_check_receive(m) <= 0) {
@@ -213,8 +240,19 @@ int main(void) {
       process_metadata(files, (const struct MetadataPacket *)buffer);
     // } else if (n >= (int)offsetof(struct DataPacket, data)) {
     } else if (packet_type == DATA_TYPE) {
-      process_data(files, (const struct DataPacket *)buffer, n);
+      process_data(files, (const struct DataPacket *)buffer, n, &statistics);
     }
+
+    // print statistics if done
+    if (statistics.done) {
+        printf("EVERYTHING RECIEVED!\n");
+        double total_time = difftime(statistics.end_time, statistics.kickoff_time);
+        printf("Total time in seconds: %.2f\n", total_time);
+
+        // Let's break out of the while loop if done too
+        break;
+    }
+
   }
 
   multicast_destroy(m);
