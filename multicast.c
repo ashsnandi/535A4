@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
 #include "multicast.h"
 
 mcast_t *multicast_init(char *mcast_addr, int sport, int rport)
@@ -25,6 +26,12 @@ mcast_t *multicast_init(char *mcast_addr, int sport, int rport)
     setsockopt(m->sock, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 #endif
     setsockopt(m->sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+    unsigned char ttl = 1;
+    setsockopt(m->sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    unsigned char loop = 1;
+    setsockopt(m->sock, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
     bzero((char *)&(m->addr), sizeof(m->addr));
     m->addr.sin_family = AF_INET;
@@ -56,6 +63,15 @@ int multicast_send(mcast_t *m, void *msg, int msglen)
         perror("sendto:");
         exit(1);
     }
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local_addr.sin_port = m->addr.sin_port;
+
+    sendto(m->sock, msg, msglen, 0, (struct sockaddr *)&local_addr, sizeof(local_addr));
+
     return cnt;
 }
 
@@ -70,6 +86,16 @@ void multicast_setup_recv(mcast_t *m)
     {
         perror("setsockopt mreq");
         exit(1);
+    }
+
+    struct ip_mreq loopback_mreq = m->mreq;
+    loopback_mreq.imr_interface.s_addr = inet_addr("127.0.0.1");
+    if (setsockopt(m->sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &loopback_mreq, sizeof(loopback_mreq)) < 0)
+    {
+        if (errno != EADDRINUSE)
+        {
+            perror("setsockopt loopback mreq");
+        }
     }
 }
 
