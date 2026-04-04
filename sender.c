@@ -16,7 +16,37 @@
 #include <unistd.h> // for sleeping
 #include <time.h> // for stats timing
 
-uint32_t compute_chunk_checksum(char *givenChunk, int size);
+/* CRC-32 polynomial: standard 0x04C11DB7 */
+static uint32_t crc32_table[256];
+static bool crc32_table_initialized = false;
+
+static void init_crc32_table(void) {
+  if (crc32_table_initialized) return;
+  
+  for (uint32_t i = 0; i < 256; i++) {
+    uint32_t crc = i;
+    for (int j = 0; j < 8; j++) {
+      if (crc & 1) {
+        crc = (crc >> 1) ^ 0xEDB88320;
+      } else {
+        crc = crc >> 1;
+      }
+    }
+    crc32_table[i] = crc;
+  }
+  crc32_table_initialized = true;
+}
+
+/* Compute CRC-32 checksum of data buffer */
+uint32_t compute_chunk_checksum(char *givenChunk, int size) {
+  init_crc32_table();
+  uint32_t crc = 0xFFFFFFFF;
+  for (int i = 0; i < size; i++) {
+    uint8_t byte = (uint8_t)givenChunk[i];
+    crc = crc32_table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFF;
+}
 
 struct send_statistics {
     uint32_t data_packets_sent;
@@ -29,9 +59,10 @@ struct send_statistics {
 // helper: open one file and split into chunks
 // Note that this includes no error checks as of now
 struct chunked_file chunk_a_file(char *filename, int file_id, int chunk_size) {
+    printf("[CHUNKING] Processing file: %s (chunk_size=%d bytes)\n", filename, chunk_size);
 
     //initialize file checksum
-    uint32_t file_checksum = 0;
+    uint32_t file_checksum = 0xFFFFFFFF;
 
     // Open the file
     FILE *file = fopen(filename, "rb");
@@ -59,9 +90,12 @@ struct chunked_file chunk_a_file(char *filename, int file_id, int chunk_size) {
         exit(1);
     }
 
+    printf("[CHUNKING] File size: %ld bytes\n", file_size);
+
     // Figure out total chunks needed for memory allocation
     // get total chunks from file size and chunk size, add 1 if there's a remainder
     int total_chunks = file_size / chunk_size + (file_size % chunk_size != 0);
+    printf("[CHUNKING] Total chunks needed: %d\n", total_chunks);
     // Allocate memory for chunk pointers, chunk sizes, and chunk checksums
     char **chunks = malloc(total_chunks * sizeof(char*));
     int *chunk_sizes = malloc(total_chunks * sizeof(int));
@@ -88,12 +122,19 @@ struct chunked_file chunk_a_file(char *filename, int file_id, int chunk_size) {
         // Get chunk checksum and store it
         chunk_checksums[i] = compute_chunk_checksum(chunks[i], temp_chunk_size);
 
-        // Add chunk checksum to file checksum (simple aggregate)
-        file_checksum += chunk_checksums[i]; // simple aggregate checksum
+        // Add chunk checksum to file checksum using CRC-32
+        for (int k = 0; k < chunk_sizes[i]; k++) {
+            uint8_t byte = (uint8_t)chunks[i][k];
+            file_checksum = crc32_table[(file_checksum ^ byte) & 0xFF] ^ (file_checksum >> 8);
+        }
+        printf("[CHUNKING] Chunk %d: %d bytes, CRC-32=0x%08x\n", i, chunk_sizes[i], chunk_checksums[i]);
     }
 
     // Close because don't need it anymore, all necessary data is stored
     fclose(file);
+    
+    file_checksum ^= 0xFFFFFFFF;
+    printf("[CHUNKING] File CRC-32: 0x%08x\n\n", file_checksum);
 
     // create a chunked file to return with all the info for this file
     struct chunked_file chunkedFile;
@@ -107,15 +148,6 @@ struct chunked_file chunk_a_file(char *filename, int file_id, int chunk_size) {
     chunkedFile.file_checksum = file_checksum;
 
     return chunkedFile;
-}
-
-uint32_t compute_chunk_checksum(char *givenChunk, int size) {
-    uint32_t sum = 0;
-    for (int i = 0; i < size; i++) {
-        // just adds the numeric value of byte to the sum
-        sum += (unsigned char)givenChunk[i];
-    }
-    return sum;
 }
 
 // helper for sending a chunk
@@ -182,6 +214,40 @@ void send_metadata_packet(mcast_t *m, struct chunked_file file, struct send_stat
     stats->bytes_sent += packet_size;
 }
 
+// helper for handling retransmission requests from receivers
+void handle_retransmission_request(mcast_t *m, struct chunked_file *files, int file_count, 
+                                   const struct RequestPacket *req, struct send_statistics *stats) {
+    if (req->file_id < 0 || req->file_id >= file_count) {
+        return;
+    }
+
+    if (req->seq_num < 0 || req->seq_num >= files[req->file_id].total_chunks) {
+        return;
+    }
+
+    struct chunked_file *file = &files[req->file_id];
+    int chunk_size = file->chunk_sizes[req->seq_num];
+    size_t packet_size = offsetof(struct DataPacket, data) + chunk_size;
+    struct DataPacket *dPac = malloc(packet_size);
+    
+    if (!dPac) {
+        fprintf(stderr, "Failed to allocate retransmission packet\n");
+        return;
+    }
+
+    dPac->seq_num = req->seq_num;
+    dPac->file_id = file->file_id;
+    dPac->chunk_checksum = file->chunk_checksums[req->seq_num];
+    dPac->type = DATA_TYPE;
+    memcpy(dPac->data, file->chunks[req->seq_num], chunk_size);
+
+    multicast_send(m, dPac, (int)packet_size);
+    free(dPac);
+
+    stats->data_packets_sent++;
+    stats->bytes_sent += packet_size;
+}
+
 
 // Need to implement statistics related stuff as well. Doing after core functionality is working
 
@@ -241,9 +307,20 @@ int main(int argc, char *argv[]) {
     statistics.meta_packets_sent = 0;
     statistics.bytes_sent = 0;
 
+    printf("\n========================================\n");
+    printf("[SENDER] Starting multicast file sender\n");
+    printf("========================================\n");
+    printf("[CHUNKING] Chunk size set to: %d bytes\n", chunk_size);
+    printf("[CHUNKING] Files to send: %d\n\n", file_count);
+
     // initialize multicast sender
     // This is example code right here
-    mcast_t *m = multicast_init("239.0.0.1", 5000, 5000); 
+    printf("[TRANSMISSION] Initializing multicast group 239.0.0.1:5000\n");
+    mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
+    printf("[TRANSMISSION] Multicast initialized, starting transmission cycle...\n\n");
+    
+    // Also set up receiver to handle retransmission requests from receivers
+    multicast_setup_recv(m); 
 
     // load all files into memory as chunks
     for (int i = 0; i < file_count; i++) {
@@ -253,6 +330,19 @@ int main(int argc, char *argv[]) {
     }
 
     while (1) {
+        // Check for retransmission requests from receivers (non-blocking check)
+        unsigned char req_buffer[sizeof(struct RequestPacket)];
+        if (multicast_check_receive(m) > 0) {
+            int n = multicast_receive(m, req_buffer, sizeof(req_buffer));
+            if (n >= (int)sizeof(struct RequestPacket)) {
+                int packet_type = *((int *)req_buffer);
+                if (packet_type == REQUEST_TYPE) {
+                    const struct RequestPacket *req = (const struct RequestPacket *)req_buffer;
+                    handle_retransmission_request(m, files, file_count, req, &statistics);
+                }
+            }
+        }
+
         // Send all metadata
         for (int i = 0; i < file_count; i++) {
             send_metadata_packet(m, files[i], &statistics);
@@ -280,15 +370,13 @@ int main(int argc, char *argv[]) {
         bytesPerSec = statistics.bytes_sent / total_time;
         
 
-        printf("////////////// Statistics ///////////////\n");
-        printf("  Cycles: %u\n", statistics.cycles_sent);
-        printf("  Meta packets fired: %u\n", statistics.meta_packets_sent);
-        printf("  Data packets fired: %u\n", statistics.data_packets_sent);
-        printf("  Throughput in packets/sec: %.2f\n", packsPerSec);
-        printf("  Byte rate in bytes/sec: %.2f\n", bytesPerSec);
-
-        // printf("  Total chunks: %u\n", statistics.chunks_sent);
-        // printf("  Total bytes: %u\n", statistics.bytes_sent);
+        printf("\n[TRANSMISSION STATISTICS - Cycle %u]\n", statistics.cycles_sent);
+        printf("  Total time elapsed: %.2f seconds\n", total_time);
+        printf("  Meta packets sent: %u\n", statistics.meta_packets_sent);
+        printf("  Data packets sent: %u\n", statistics.data_packets_sent);
+        printf("  Throughput: %.2f packets/sec\n", packsPerSec);
+        printf("  Byte rate: %.2f bytes/sec\n", bytesPerSec);
+        printf("\n");
     }
 
     // free chunk memory

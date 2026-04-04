@@ -9,6 +9,7 @@
 
 #define META_TYPE 0
 #define DATA_TYPE 1
+#define REQUEST_TYPE 2
 
 struct MetadataPacket {
     int type; // 0 for meta
@@ -26,6 +27,12 @@ struct DataPacket {
     uint32_t chunk_checksum;
     // flexible array has to be last in struct. Just a thing in C
     char data[]; // flexible
+};
+
+struct RequestPacket {
+    int type; // 2 for request
+    int file_id;
+    int seq_num;
 };
 
 struct chunked_file {
