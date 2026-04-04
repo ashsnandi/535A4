@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <errno.h>
@@ -160,7 +161,7 @@ static int write_completed_file(const struct received_file *file) {
 
   fclose(out);
 
-  printf("[DISK WRITE] Written %lu bytes to disk\n", total_bytes_written);
+  printf("[DISK WRITE] Written %" PRIu64 " bytes to disk\n", total_bytes_written);
   printf("[FILE VALIDATION] CRC-32 verification: expected=0x%08x, calculated=0x%08x\n", 
          file->file_checksum, calculated_file_checksum);
 
@@ -169,7 +170,7 @@ static int write_completed_file(const struct received_file *file) {
     return -1;
   }
 
-  printf("[FILE VALIDATION] SUCCESS: File %s validated and saved to %s (%u chunks, %lu bytes)\n", 
+  printf("[FILE VALIDATION] SUCCESS: File %s validated and saved to %s (%u chunks, %" PRIu64 " bytes)\n", 
          file->filename, path, file->total_chunks, total_bytes_written);
   return 0;
 }
