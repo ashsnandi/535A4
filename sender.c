@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/stat.h>
 #include "multicast.h"
 // shared header for shared defs?
 #include "shared_structs.h"
@@ -55,6 +56,41 @@ struct send_statistics {
     uint32_t cycles_sent;
     time_t kickoff_time;
 };
+
+static void append_sender_stats_csv(const struct send_statistics *statistics,
+                                    double total_time,
+                                    double packsPerSec,
+                                    double bytesPerSec) {
+    const char *csv_path = "sender_stats.csv";
+    bool needs_header = false;
+
+    struct stat st;
+    if (stat(csv_path, &st) != 0) {
+        needs_header = true;
+    }
+
+    FILE *csv = fopen(csv_path, "a");
+    if (!csv) {
+        perror("fopen sender_stats.csv");
+        return;
+    }
+
+    if (needs_header) {
+        fprintf(csv, "kickoff_epoch,cycle,total_time_sec,meta_packets_sent,data_packets_sent,bytes_sent,packets_per_sec,bytes_per_sec\n");
+    }
+
+    fprintf(csv, "%ld,%u,%.2f,%u,%u,%llu,%.2f,%.2f\n",
+            (long)statistics->kickoff_time,
+            statistics->cycles_sent,
+            total_time,
+            statistics->meta_packets_sent,
+            statistics->data_packets_sent,
+            (unsigned long long)statistics->bytes_sent,
+            packsPerSec,
+            bytesPerSec);
+
+    fclose(csv);
+}
 
 // helper: open one file and split into chunks
 // Note that this includes no error checks as of now
@@ -150,8 +186,14 @@ struct chunked_file chunk_a_file(char *filename, int file_id, int chunk_size) {
     return chunkedFile;
 }
 
+static void process_pending_requests(mcast_t *data_m, mcast_t *request_m,
+                                     struct chunked_file *files, int file_count,
+                                     struct send_statistics *stats);
+
 // helper for sending a chunk
-void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count, struct send_statistics *s) {
+void send_all_chunks(mcast_t *data_m, mcast_t *request_m,
+                     struct chunked_file *files, int file_count,
+                     struct send_statistics *s) {
     // send chunks from all files sequentially for now (can optimize later using round robin or something)
     for (int i = 0; i < file_count; i++) {
         for (int j = 0; j < files[i].total_chunks; j++) {
@@ -172,16 +214,23 @@ void send_all_chunks(mcast_t *m, struct chunked_file *files, int file_count, str
             memcpy(dPac->data, files[i].chunks[j], chunk_size);
             // send data packet using multicast_send (need to implement this function in multicast.c)
 
-            multicast_send(m, dPac, (int)packet_size);
+            multicast_send(data_m, dPac, (int)packet_size);
             free(dPac);
 
             // Add to statistics
             s->data_packets_sent++;
             s->bytes_sent += packet_size;
+
+            // Pick up any retransmission requests between chunk sends.
+            // The sender only listens on the dedicated request socket, so this stays nonblocking.
+            process_pending_requests(data_m, request_m, files, file_count, s);
         }
 
-        // add a small delay to not overwhelm the network
-        sleep(1);
+        // add a small delay to not overwhelm the network, but keep servicing requests
+        for (int pause_ms = 0; pause_ms < 1000; pause_ms += 100) {
+            usleep(100000);
+            process_pending_requests(data_m, request_m, files, file_count, s);
+        }
     }
 }
 
@@ -246,6 +295,27 @@ void handle_retransmission_request(mcast_t *m, struct chunked_file *files, int f
 
     stats->data_packets_sent++;
     stats->bytes_sent += packet_size;
+}
+
+static void process_pending_requests(mcast_t *data_m, mcast_t *request_m,
+                                     struct chunked_file *files, int file_count,
+                                     struct send_statistics *stats) {
+    unsigned char req_buffer[sizeof(struct RequestPacket)];
+
+    while (poll(request_m->fds, request_m->nfds, 0) > 0) {
+        int n = multicast_receive(request_m, req_buffer, sizeof(req_buffer));
+        if (n < (int)sizeof(struct RequestPacket)) {
+            continue;
+        }
+
+        int packet_type = *((int *)req_buffer);
+        if (packet_type != REQUEST_TYPE) {
+            continue;
+        }
+
+        const struct RequestPacket *req = (const struct RequestPacket *)req_buffer;
+        handle_retransmission_request(data_m, files, file_count, req, stats);
+    }
 }
 
 
@@ -316,11 +386,11 @@ int main(int argc, char *argv[]) {
     // initialize multicast sender
     // This is example code right here
     printf("[TRANSMISSION] Initializing multicast group 239.0.0.1:5000\n");
-    mcast_t *m = multicast_init("239.0.0.1", 5000, 5000);
+    printf("[TRANSMISSION] Listening for retransmission requests on 239.0.0.1:5001\n");
+    mcast_t *m = multicast_init("239.0.0.1", 5000, 0);
+    mcast_t *request_m = multicast_init("239.0.0.1", 5001, 5001);
+    multicast_setup_recv(request_m);
     printf("[TRANSMISSION] Multicast initialized, starting transmission cycle...\n\n");
-    
-    // Also set up receiver to handle retransmission requests from receivers
-    multicast_setup_recv(m); 
 
     // load all files into memory as chunks
     for (int i = 0; i < file_count; i++) {
@@ -330,18 +400,8 @@ int main(int argc, char *argv[]) {
     }
 
     while (1) {
-        // Check for retransmission requests from receivers (non-blocking check)
-        unsigned char req_buffer[sizeof(struct RequestPacket)];
-        if (multicast_check_receive(m) > 0) {
-            int n = multicast_receive(m, req_buffer, sizeof(req_buffer));
-            if (n >= (int)sizeof(struct RequestPacket)) {
-                int packet_type = *((int *)req_buffer);
-                if (packet_type == REQUEST_TYPE) {
-                    const struct RequestPacket *req = (const struct RequestPacket *)req_buffer;
-                    handle_retransmission_request(m, files, file_count, req, &statistics);
-                }
-            }
-        }
+        // Drain any queued retransmission requests before sending the next cycle.
+        process_pending_requests(m, request_m, files, file_count, &statistics);
 
         // Send all metadata
         for (int i = 0; i < file_count; i++) {
@@ -350,8 +410,11 @@ int main(int argc, char *argv[]) {
 
         sleep(1);
 
-        send_all_chunks(m, files, file_count, &statistics);
+        send_all_chunks(m, request_m, files, file_count, &statistics);
         // Send all chunks from all files cyclically for now (can optimize later)
+
+        // Drain requests again so late requests are handled before the next sleep/loop.
+        process_pending_requests(m, request_m, files, file_count, &statistics);
 
         // Update stats
         statistics.cycles_sent++;
@@ -377,6 +440,8 @@ int main(int argc, char *argv[]) {
         printf("  Throughput: %.2f packets/sec\n", packsPerSec);
         printf("  Byte rate: %.2f bytes/sec\n", bytesPerSec);
         printf("\n");
+
+        append_sender_stats_csv(&statistics, total_time, packsPerSec, bytesPerSec);
     }
 
     // free chunk memory

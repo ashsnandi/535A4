@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <errno.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include "multicast.h"
 #include "shared_structs.h"
@@ -23,6 +24,36 @@ struct recieve_statistics {
     time_t kickoff_time;
     time_t end_time;
 };
+
+static void append_receiver_stats_csv(const struct recieve_statistics *statistics,
+                                      int files_received) {
+  const char *csv_path = "receiver_stats.csv";
+  bool needs_header = false;
+
+  struct stat st;
+  if (stat(csv_path, &st) != 0) {
+    needs_header = true;
+  }
+
+  FILE *csv = fopen(csv_path, "a");
+  if (!csv) {
+    perror("fopen receiver_stats.csv");
+    return;
+  }
+
+  if (needs_header) {
+    fprintf(csv, "kickoff_epoch,end_epoch,total_time_sec,files_received\n");
+  }
+
+  double total_time = difftime(statistics->end_time, statistics->kickoff_time);
+  fprintf(csv, "%ld,%ld,%.2f,%d\n",
+          (long)statistics->kickoff_time,
+          (long)statistics->end_time,
+          total_time,
+          files_received);
+
+  fclose(csv);
+}
 
 /*
  * In-memory state for one file being reconstructed from multicast chunks.
@@ -40,7 +71,7 @@ struct received_file {
   uint32_t received_count;
   char filename[m_file_name_max_len];
   time_t metadata_received_time;
-  bool requests_sent;
+  time_t last_request_time;
 };
 
 /* CRC-32 polynomial: standard 0x04C11DB7 */
@@ -90,6 +121,28 @@ static int ensure_received_dir(void) {
   return -1;
 }
 
+static int send_request_packet(const struct RequestPacket *req) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = inet_addr("239.0.0.1");
+  addr.sin_port = htons(5001);
+
+  int rc = sendto(sock, req, sizeof(*req), 0, (struct sockaddr *)&addr, sizeof(addr));
+  if (rc < 0) {
+    perror("sendto request");
+  }
+
+  close(sock);
+  return rc;
+}
+
 /* Allocate and initialize per-file buffers after metadata arrives. */
 static int init_file_state(struct received_file *file, const struct MetadataPacket *meta) {
   file->file_size = meta->file_size;
@@ -98,7 +151,7 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
   file->received_count = 0;
   file->completed = false;
   file->metadata_received_time = time(NULL);
-  file->requests_sent = false;
+  file->last_request_time = 0;
 
   printf("[REASSEMBLY] Allocating buffers for file: total_chunks=%u, file_size=%u bytes\n", 
          file->total_chunks, file->file_size);
@@ -194,20 +247,27 @@ static void process_metadata(struct received_file files[], const struct Metadata
 
 /* Request missing chunks from sender for late-joiner support. */
 static void request_missing_chunks(mcast_t *m, struct received_file files[]) {
-  #define REQUEST_TIMEOUT 5  // Wait 5 seconds after metadata before requesting missing chunks
+  #define REQUEST_TIMEOUT 5   // Wait 5 seconds after metadata before requesting missing chunks
+  #define REQUEST_RETRY 2     // Re-send requests every 2 seconds until the file completes
+  (void)m;
   
   time_t now = time(NULL);
   
   for (int i = 0; i < MAX_FILES; i++) {
     struct received_file *file = &files[i];
     
-    // Skip if no metadata yet, already completed, or already sent requests
-    if (!file->has_metadata || file->completed || file->requests_sent) {
+    // Skip if no metadata yet or already completed
+    if (!file->has_metadata || file->completed) {
       continue;
     }
     
     // Only request if enough time has passed since metadata arrived
     if (difftime(now, file->metadata_received_time) < REQUEST_TIMEOUT) {
+      continue;
+    }
+
+    // Throttle retries so we don't spam the network every loop iteration.
+    if (file->last_request_time != 0 && difftime(now, file->last_request_time) < REQUEST_RETRY) {
       continue;
     }
     
@@ -220,14 +280,14 @@ static void request_missing_chunks(mcast_t *m, struct received_file files[]) {
         req.file_id = i;
         req.seq_num = j;
         
-        multicast_send(m, &req, sizeof(struct RequestPacket));
+        send_request_packet(&req);
         requests_sent++;
       }
     }
     
     if (requests_sent > 0) {
       printf("Requested %d missing chunks for file_id=%d\n", requests_sent, i);
-      file->requests_sent = true;
+      file->last_request_time = now;
     }
   }
 }
@@ -287,19 +347,6 @@ static void process_data(struct received_file files[], const struct DataPacket *
     printf("[REASSEMBLY] All chunks received for file_id=%d, reassembling...\n", packet->file_id);
     if (write_completed_file(file) == 0) {
       file->completed = true;
-
-      // scan if all files completed to update stats
-      bool totally_completed = true;
-      for (int i = 0; i < MAX_FILES; i++) {
-        if (files[i].has_metadata && !files[i].completed) {
-          totally_completed = false;
-          break;
-        }
-      }
-      if (totally_completed) {
-        s->done = true;
-        s->end_time = time(NULL);
-      }
     }
   }
 }
@@ -364,26 +411,6 @@ int main(void) {
     if (request_check_counter >= 10) {
       request_check_counter = 0;
       request_missing_chunks(m, files);
-    }
-
-    // print statistics if done
-    if (statistics.done) {
-        printf("\n========================================\n");
-        printf("[RECEIVER] ALL FILES SUCCESSFULLY RECEIVED!\n");
-        printf("========================================\n");
-        double total_time = difftime(statistics.end_time, statistics.kickoff_time);
-        printf("\n[STATISTICS]\n");
-        printf("  Total reception time: %.2f seconds\n", total_time);
-        printf("  Files received: ");
-        int count = 0;
-        for (int i = 0; i < MAX_FILES; i++) {
-          if (files[i].has_metadata) count++;
-        }
-        printf("%d\n", count);
-        printf("\n");
-
-        // Let's break out of the while loop if done too
-        break;
     }
 
   }

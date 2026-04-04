@@ -182,9 +182,13 @@ Simple additive checksum - sum of all byte values modulo 2^32. Sufficient for th
 - **Throughput (packets/sec)**: Rate of packet transmission
 - **Byte rate (bytes/sec)**: Data throughput in bytes
 
+Sender stats are also appended to `sender_stats.csv` in the workspace root after each cycle.
+
 ### Receiver Statistics
 - **Total time**: Duration from first packet received to all files verified
 - **File completion**: Per-file confirmation with chunk count and path
+
+Receiver completion stats are written to `receiver_stats.csv` when all files have been received.
 
 ### Network Efficiency
 - Early receivers get files in streaming fashion (1 cycle time)
@@ -217,6 +221,9 @@ Simple additive checksum - sum of all byte values modulo 2^32. Sufficient for th
 - To simulate crash recovery: kill and restart receiver while sender running
 - Check `received_files/` for successful file reception
 
+# Additional Things Added
+ - RDT implemented - used CRC-32 
+ - 
 ## Known Limitations
 
 - Single sender only (no sender redundancy)
@@ -227,4 +234,3 @@ Simple additive checksum - sum of all byte values modulo 2^32. Sufficient for th
 
 ## Team Contribution
 
-This project was developed collaboratively. The implementation includes core sender and receiver functionality with late-joiner support, integrity verification through checksums, and statistics tracking. Both team members contributed to design, implementation, and testing throughout the development process.
