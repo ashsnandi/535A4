@@ -2,3 +2,5 @@
 share/train.csv
 share/test.csv
 .vscode/
+.venv/
+__pycache__/

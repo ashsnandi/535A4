@@ -23,10 +23,18 @@ struct recieve_statistics {
     bool done;
     time_t kickoff_time;
     time_t end_time;
+  uint32_t files_completed;
+  uint64_t data_packets_seen;
+  uint64_t bad_data_packets;
+  uint64_t duplicate_data_packets;
+  uint64_t unique_chunks_received;
+  uint64_t retransmission_requests_sent;
+  uint64_t estimated_packets_lost;
+  uint64_t recovered_packets;
 };
 
 static void append_receiver_stats_csv(const struct recieve_statistics *statistics,
-                                      int files_received) {
+                    int files_received) {
   const char *csv_path = "receiver_stats.csv";
   bool needs_header = false;
 
@@ -42,17 +50,33 @@ static void append_receiver_stats_csv(const struct recieve_statistics *statistic
   }
 
   if (needs_header) {
-    fprintf(csv, "kickoff_epoch,end_epoch,total_time_sec,files_received\n");
+    fprintf(csv, "kickoff_time,end_time,total_time_sec,files_received,data_packets_seen,bad_data_packets,duplicate_data_packets,unique_chunks_received,retransmission_requests_sent,estimated_packets_lost,recovered_packets,recovery_rate_pct\n");
   }
 
   double total_time = difftime(statistics->end_time, statistics->kickoff_time);
-  fprintf(csv, "%ld,%ld,%.2f,%d\n",
+  double recovery_rate_pct = 0.0;
+  if (statistics->estimated_packets_lost > 0) {
+    recovery_rate_pct =
+        ((double)statistics->recovered_packets * 100.0) /
+        (double)statistics->estimated_packets_lost;
+  }
+
+  fprintf(csv, "%ld,%ld,%.2f,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.2f\n",
           (long)statistics->kickoff_time,
           (long)statistics->end_time,
           total_time,
-          files_received);
+          files_received,
+          (unsigned long long)statistics->data_packets_seen,
+          (unsigned long long)statistics->bad_data_packets,
+          (unsigned long long)statistics->duplicate_data_packets,
+          (unsigned long long)statistics->unique_chunks_received,
+          (unsigned long long)statistics->retransmission_requests_sent,
+          (unsigned long long)statistics->estimated_packets_lost,
+          (unsigned long long)statistics->recovered_packets,
+          recovery_rate_pct);
 
   fclose(csv);
+  fprintf(stderr, "[RECEIVER] Appended stats to %s\n", csv_path);
 }
 
 /*
@@ -68,11 +92,27 @@ struct received_file {
   char **chunks;
   uint32_t *chunk_sizes;
   bool *received;
+  bool *requested;
   uint32_t received_count;
   char filename[m_file_name_max_len];
   time_t metadata_received_time;
   time_t last_request_time;
 };
+
+static void free_file_state(struct received_file *file) {
+  if (file->chunks) {
+    for (uint32_t i = 0; i < file->total_chunks; i++) {
+      free(file->chunks[i]);
+    }
+  }
+
+  free(file->chunks);
+  free(file->chunk_sizes);
+  free(file->received);
+  free(file->requested);
+
+  memset(file, 0, sizeof(*file));
+}
 
 /* CRC-32 polynomial: standard 0x04C11DB7 */
 static uint32_t crc32_table[256];
@@ -159,7 +199,8 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
   file->chunks = calloc(file->total_chunks, sizeof(char *));
   file->chunk_sizes = calloc(file->total_chunks, sizeof(uint32_t));
   file->received = calloc(file->total_chunks, sizeof(bool));
-  if (!file->chunks || !file->chunk_sizes || !file->received) {
+  file->requested = calloc(file->total_chunks, sizeof(bool));
+  if (!file->chunks || !file->chunk_sizes || !file->received || !file->requested) {
     fprintf(stderr, "Allocation failed for file tracking state\n");
     return -1;
   }
@@ -242,11 +283,28 @@ static void process_metadata(struct received_file files[], const struct Metadata
     if (init_file_state(file, meta) != 0) {
       exit(1);
     }
+    return;
+  }
+
+  bool metadata_changed =
+      file->file_size != meta->file_size ||
+      file->file_checksum != meta->file_checksum ||
+      file->total_chunks != meta->total_chunks ||
+      strncmp(file->filename, meta->filename, sizeof(file->filename)) != 0;
+
+  if (file->completed || metadata_changed) {
+    printf("[LISTEN] Reinitializing state for file_id=%d (new transfer detected: %s)\n",
+           meta->file_id,
+           meta->filename);
+    free_file_state(file);
+    if (init_file_state(file, meta) != 0) {
+      exit(1);
+    }
   }
 }
 
 /* Request missing chunks from sender for late-joiner support. */
-static void request_missing_chunks(mcast_t *m, struct received_file files[]) {
+static void request_missing_chunks(mcast_t *m, struct received_file files[], struct recieve_statistics *statistics) {
   #define REQUEST_TIMEOUT 5   // Wait 5 seconds after metadata before requesting missing chunks
   #define REQUEST_RETRY 2     // Re-send requests every 2 seconds until the file completes
   (void)m;
@@ -280,8 +338,14 @@ static void request_missing_chunks(mcast_t *m, struct received_file files[]) {
         req.file_id = i;
         req.seq_num = j;
         
-        send_request_packet(&req);
-        requests_sent++;
+        if (send_request_packet(&req) >= 0) {
+          requests_sent++;
+          statistics->retransmission_requests_sent++;
+          if (!file->requested[j]) {
+            file->requested[j] = true;
+            statistics->estimated_packets_lost++;
+          }
+        }
       }
     }
     
@@ -297,7 +361,10 @@ static void request_missing_chunks(mcast_t *m, struct received_file files[]) {
  * and finalize the file when all chunks are present.
  */
 static void process_data(struct received_file files[], const struct DataPacket *packet, int packet_len, struct recieve_statistics *s) {
+  s->data_packets_seen++;
+
   if (packet->file_id < 0 || packet->file_id >= MAX_FILES) {
+    s->bad_data_packets++;
     return;
   }
 
@@ -307,25 +374,30 @@ static void process_data(struct received_file files[], const struct DataPacket *
   }
 
   if (packet->seq_num < 0 || (uint32_t)packet->seq_num >= file->total_chunks) {
+    s->bad_data_packets++;
     return;
   }
 
   uint32_t payload_offset = (uint32_t)offsetof(struct DataPacket, data);
   if (packet_len <= (int)payload_offset) {
+    s->bad_data_packets++;
     return;
   }
 
   uint32_t payload_len = (uint32_t)packet_len - payload_offset;
   if (payload_len == 0 || payload_len > file->file_size) {
+    s->bad_data_packets++;
     return;
   }
 
   uint32_t calculated = compute_chunk_checksum(packet->data, payload_len);
   if (calculated != packet->chunk_checksum) {
+    s->bad_data_packets++;
     return;
   }
 
   if (file->received[packet->seq_num]) {
+    s->duplicate_data_packets++;
     return;
   }
 
@@ -339,6 +411,11 @@ static void process_data(struct received_file files[], const struct DataPacket *
   file->chunk_sizes[packet->seq_num] = payload_len;
   file->received[packet->seq_num] = true;
   file->received_count++;
+  s->unique_chunks_received++;
+
+  if (file->requested[packet->seq_num]) {
+    s->recovered_packets++;
+  }
   
   printf("[OUT-OF-ORDER] Buffered chunk %d/%u in RAM (size=%u bytes, CRC-32=0x%08x)\n", 
          packet->seq_num + 1, file->total_chunks, payload_len, packet->chunk_checksum);
@@ -347,11 +424,31 @@ static void process_data(struct received_file files[], const struct DataPacket *
     printf("[REASSEMBLY] All chunks received for file_id=%d, reassembling...\n", packet->file_id);
     if (write_completed_file(file) == 0) {
       file->completed = true;
+      s->files_completed++;
+      s->end_time = time(NULL);
+
+      double recovery_rate_pct = 0.0;
+      if (s->estimated_packets_lost > 0) {
+        recovery_rate_pct = ((double)s->recovered_packets * 100.0) /
+                            (double)s->estimated_packets_lost;
+      }
+
+      printf("[RECEIVER STATISTICS]\n");
+      printf("  Files completed: %u\n", s->files_completed);
+      printf("  Data packets seen: %" PRIu64 "\n", s->data_packets_seen);
+      printf("  Estimated packets lost: %" PRIu64 "\n", s->estimated_packets_lost);
+      printf("  Recovered packets: %" PRIu64 "\n", s->recovered_packets);
+      printf("  Recovery rate: %.2f%%\n", recovery_rate_pct);
+
+      append_receiver_stats_csv(s, (int)s->files_completed);
     }
   }
 }
 
 int main(void) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
   printf("\n========================================\n");
   printf("[RECEIVER] Starting multicast receiver\n");
   printf("========================================\n\n");
@@ -374,7 +471,16 @@ int main(void) {
   // start time for stats
   struct recieve_statistics statistics;
   statistics.kickoff_time = time(NULL);
+  statistics.end_time = statistics.kickoff_time;
   statistics.done = false;
+  statistics.files_completed = 0;
+  statistics.data_packets_seen = 0;
+  statistics.bad_data_packets = 0;
+  statistics.duplicate_data_packets = 0;
+  statistics.unique_chunks_received = 0;
+  statistics.retransmission_requests_sent = 0;
+  statistics.estimated_packets_lost = 0;
+  statistics.recovered_packets = 0;
   
   // Counter to throttle retransmission requests
   int request_check_counter = 0;
@@ -387,7 +493,7 @@ int main(void) {
       if (request_check_counter >= 10) {
         request_check_counter = 0;
         printf("[RETRANSMISSION] Checking for missing chunks and sending requests...\n");
-        request_missing_chunks(m, files);
+        request_missing_chunks(m, files, &statistics);
       }
       continue;
     }
@@ -410,7 +516,7 @@ int main(void) {
     request_check_counter++;
     if (request_check_counter >= 10) {
       request_check_counter = 0;
-      request_missing_chunks(m, files);
+      request_missing_chunks(m, files, &statistics);
     }
 
   }

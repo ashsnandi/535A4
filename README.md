@@ -67,6 +67,14 @@ The receiver joins the multicast group and reconstructs files as they arrive.
 
 ```
 
+### Graphing Stats (ASCII)
+
+Build and run a simple terminal graph utility for sender/receiver CSV metrics:
+
+```bash
+make stats_graph
+./stats_graph
+```
   
 
 **Receiver Features:**
@@ -178,6 +186,9 @@ Sender stats are also appended to `sender_stats.csv` in the workspace root after
 ### Receiver Statistics
 - **Total time**: Duration from first packet received to all files verified
 - **File completion**: Per-file confirmation with chunk count and path
+- **Estimated packet loss**: Number of unique missing chunks detected and requested
+- **Recovered packets**: Number of requested chunks successfully received later
+- **Recovery rate**: `recovered_packets / estimated_packets_lost * 100`
 Receiver completion stats are written to `receiver_stats.csv` when all files have been received.
 
   
@@ -192,32 +203,33 @@ Receiver completion stats are written to `receiver_stats.csv` when all files hav
 ## File Organization
 
 ```
-
 535A4/
-
 ├── Makefile # Build configuration
-
 ├── README.md # This file
-
 ├── multicast.h/.c # Multicast socket utilities
-
 ├── shared_structs.h # Common packet definitions
-
 ├── sender.c # Sender implementation
-
 ├── receiver.c # Receiver implementation
-
 ├── sender # Compiled sender binary
-
 ├── receiver # Compiled receiver binary
-
 ├── received_files/ # Output directory for received files
-
 └── share/ # Test files
-
 └── descr.txt # Sample file for testing
 
 ```
 
   
+## Packet Loss Simulation (on linux)
+Run `sudo tc qdisc add dev wlan0 root netem loss 20%` 
+- Start receiver
+run:
+`sudo tc qdisc del dev wlan0 root`
+
+This is just a linux command that does a network emulation with a packet loss of 20 for testing purposes
+
+## MatplotLib Graphing
+I just repurposed a matplotlib script I had to graph packet loss over added networks
+you can create a stats png wtith `plot_stats.py`
+
+
 ## Team Contribution

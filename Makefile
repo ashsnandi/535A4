@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wall -Wextra -g -O2
 LDFLAGS = -lm
 
-TARGETS = sender receiver
+TARGETS = sender receiver stats_graph
 OBJS = multicast.o
 
 .PHONY: all clean
@@ -13,6 +13,9 @@ sender: sender.c $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 receiver: receiver.c $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+stats_graph: stats_graph.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 multicast.o: multicast.c multicast.h

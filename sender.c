@@ -52,6 +52,8 @@ uint32_t compute_chunk_checksum(char *givenChunk, int size) {
 struct send_statistics {
     uint32_t data_packets_sent;
     uint32_t meta_packets_sent;
+    uint32_t retransmission_packets_sent;
+    uint32_t retransmission_requests_received;
     uint64_t bytes_sent;
     uint32_t cycles_sent;
     time_t kickoff_time;
@@ -76,15 +78,17 @@ static void append_sender_stats_csv(const struct send_statistics *statistics,
     }
 
     if (needs_header) {
-        fprintf(csv, "kickoff_epoch,cycle,total_time_sec,meta_packets_sent,data_packets_sent,bytes_sent,packets_per_sec,bytes_per_sec\n");
+        fprintf(csv, "kickoff_time,cycle,total_time_sec,meta_packets_sent,data_packets_sent,retransmission_packets_sent,retransmission_requests_received,bytes_sent,packets_per_sec,bytes_per_sec\n");
     }
 
-    fprintf(csv, "%ld,%u,%.2f,%u,%u,%llu,%.2f,%.2f\n",
+    fprintf(csv, "%ld,%u,%.2f,%u,%u,%u,%u,%llu,%.2f,%.2f\n",
             (long)statistics->kickoff_time,
             statistics->cycles_sent,
             total_time,
             statistics->meta_packets_sent,
             statistics->data_packets_sent,
+            statistics->retransmission_packets_sent,
+            statistics->retransmission_requests_received,
             (unsigned long long)statistics->bytes_sent,
             packsPerSec,
             bytesPerSec);
@@ -293,6 +297,7 @@ void handle_retransmission_request(mcast_t *m, struct chunked_file *files, int f
     multicast_send(m, dPac, (int)packet_size);
     free(dPac);
 
+    stats->retransmission_packets_sent++;
     stats->data_packets_sent++;
     stats->bytes_sent += packet_size;
 }
@@ -314,6 +319,7 @@ static void process_pending_requests(mcast_t *data_m, mcast_t *request_m,
         }
 
         const struct RequestPacket *req = (const struct RequestPacket *)req_buffer;
+        stats->retransmission_requests_received++;
         handle_retransmission_request(data_m, files, file_count, req, stats);
     }
 }
@@ -375,6 +381,8 @@ int main(int argc, char *argv[]) {
     statistics.cycles_sent = 0;
     statistics.data_packets_sent = 0;
     statistics.meta_packets_sent = 0;
+    statistics.retransmission_packets_sent = 0;
+    statistics.retransmission_requests_received = 0;
     statistics.bytes_sent = 0;
 
     printf("\n========================================\n");
@@ -437,6 +445,8 @@ int main(int argc, char *argv[]) {
         printf("  Total time elapsed: %.2f seconds\n", total_time);
         printf("  Meta packets sent: %u\n", statistics.meta_packets_sent);
         printf("  Data packets sent: %u\n", statistics.data_packets_sent);
+        printf("  Retransmission requests received: %u\n", statistics.retransmission_requests_received);
+        printf("  Retransmission packets sent: %u\n", statistics.retransmission_packets_sent);
         printf("  Throughput: %.2f packets/sec\n", packsPerSec);
         printf("  Byte rate: %.2f bytes/sec\n", bytesPerSec);
         printf("\n");
