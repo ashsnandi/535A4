@@ -129,10 +129,9 @@ make stats_graph
 - Ensures no chunks were swapped or missing
 - File written to disk only if checksums match
 
-  
-
 **Checksum Algorithm:**
 Simple additive checksum - sum of all byte values modulo 2^32. Sufficient for this LAN-based system.
+
   
 
 ### 4. Chunking Strategy
@@ -231,5 +230,3 @@ This is just a linux command that does a network emulation with a packet loss of
 I just repurposed a matplotlib script I had to graph packet loss over added networks
 you can create a stats png wtith `plot_stats.py`
 
-
-## Team Contribution

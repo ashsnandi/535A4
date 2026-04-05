@@ -211,6 +211,61 @@ static int init_file_state(struct received_file *file, const struct MetadataPack
   return 0;
 }
 
+static void mark_file_completed_from_metadata(struct received_file *file,
+                                              const struct MetadataPacket *meta) {
+  file->file_size = meta->file_size;
+  file->file_checksum = meta->file_checksum;
+  file->total_chunks = meta->total_chunks;
+  file->received_count = meta->total_chunks;
+  file->has_metadata = true;
+  file->completed = true;
+  file->metadata_received_time = time(NULL);
+  file->last_request_time = 0;
+  snprintf(file->filename, sizeof(file->filename), "%s", meta->filename);
+}
+
+static bool existing_file_matches_metadata(const struct MetadataPacket *meta) {
+  char path[256];
+  snprintf(path, sizeof(path), "received_files/%s", meta->filename);
+
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    return false;
+  }
+
+  if ((uint64_t)st.st_size != (uint64_t)meta->file_size) {
+    return false;
+  }
+
+  FILE *in = fopen(path, "rb");
+  if (!in) {
+    return false;
+  }
+
+  init_crc32_table();
+  uint32_t crc = 0xFFFFFFFF;
+  unsigned char buffer[4096];
+
+  while (1) {
+    size_t n = fread(buffer, 1, sizeof(buffer), in);
+    if (n == 0) {
+      break;
+    }
+    for (size_t i = 0; i < n; i++) {
+      crc = crc32_table[(crc ^ buffer[i]) & 0xFF] ^ (crc >> 8);
+    }
+  }
+
+  bool ok = (ferror(in) == 0);
+  fclose(in);
+  if (!ok) {
+    return false;
+  }
+
+  crc ^= 0xFFFFFFFF;
+  return crc == meta->file_checksum;
+}
+
 /*
  * Reassemble a completed file in chunk order and verify final checksum
  * before reporting success.
@@ -277,6 +332,14 @@ static void process_metadata(struct received_file files[], const struct Metadata
 
   struct received_file *file = &files[meta->file_id];
   if (!file->has_metadata) {
+    if (existing_file_matches_metadata(meta)) {
+      mark_file_completed_from_metadata(file, meta);
+      printf("[LISTEN] File %s already exists and matches checksum; skipping transfer for file_id=%d\n",
+             meta->filename,
+             meta->file_id);
+      return;
+    }
+
     printf("[LISTEN] Received metadata packet for file_id=%d, filename=%s\n", meta->file_id, meta->filename);
     printf("[LISTEN] File info: chunks=%u, size=%u bytes, CRC-32=0x%08x\n", 
            meta->total_chunks, meta->file_size, meta->file_checksum);
@@ -292,14 +355,28 @@ static void process_metadata(struct received_file files[], const struct Metadata
       file->total_chunks != meta->total_chunks ||
       strncmp(file->filename, meta->filename, sizeof(file->filename)) != 0;
 
-  if (file->completed || metadata_changed) {
+  if (metadata_changed) {
     printf("[LISTEN] Reinitializing state for file_id=%d (new transfer detected: %s)\n",
            meta->file_id,
            meta->filename);
     free_file_state(file);
+
+    if (existing_file_matches_metadata(meta)) {
+      mark_file_completed_from_metadata(file, meta);
+      printf("[LISTEN] File %s already exists and matches checksum; skipping transfer for file_id=%d\n",
+             meta->filename,
+             meta->file_id);
+      return;
+    }
+
     if (init_file_state(file, meta) != 0) {
       exit(1);
     }
+    return;
+  }
+
+  if (file->completed) {
+    return;
   }
 }
 
